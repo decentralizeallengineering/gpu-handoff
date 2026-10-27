@@ -15,6 +15,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 from . import probe
 
@@ -127,37 +128,45 @@ class Ctx:
 # --------------------------------------------------------------------------
 # precheck
 # --------------------------------------------------------------------------
-def build_checks(ctx: Ctx, addr: str, vm: str | None) -> list[tuple[str, bool, str]]:
-    sysfs = ctx.sysfs
-    rows: list[tuple[str, bool, str]] = []
-    if not probe.device_exists(sysfs, addr):
-        return [("device present", False, f"{addr} not found under {sysfs}")]
-    rows.append(("device present", True, addr))
+class Check(NamedTuple):
+    """One precheck row. ok is True (PASS), False (FAIL) or None (WARN)."""
 
-    group = probe.group_report(sysfs, addr)
+    name: str
+    ok: bool | None
+    detail: str
+    fix: str = ""
+
+
+def check_group(ctx: Ctx, addr: str, vm: str | None) -> Check:
+    group = probe.group_report(ctx.sysfs, addr)
     if not group.members:
-        rows.append(
-            ("iommu group clean", False, "no IOMMU group (is the IOMMU enabled?)")
+        return Check(
+            "iommu group clean",
+            False,
+            "no IOMMU group (is the IOMMU enabled?)",
+            "enable VT-d or AMD-Vi in the firmware; on Intel also boot with intel_iommu=on",
         )
-    elif group.clean:
-        rows.append(("iommu group clean", True, "members: " + ", ".join(group.members)))
-    else:
-        rows.append(
-            (
-                "iommu group clean",
-                False,
-                "foreign members: "
-                + ", ".join(group.foreign)
-                + " (all: "
-                + ", ".join(group.members)
-                + ")",
-            )
-        )
+    if group.clean:
+        return Check("iommu group clean", True, "members: " + ", ".join(group.members))
+    return Check(
+        "iommu group clean",
+        False,
+        "foreign members: "
+        + ", ".join(group.foreign)
+        + " (all: "
+        + ", ".join(group.members)
+        + ")",
+    )
 
-    drv = probe.current_driver(sysfs, addr)
-    rows.append(("current driver", drv in probe.KNOWN_DRIVERS, drv))
 
+def check_driver(ctx: Ctx, addr: str, vm: str | None) -> Check:
+    drv = probe.current_driver(ctx.sysfs, addr)
+    return Check("current driver", drv in probe.KNOWN_DRIVERS, drv)
+
+
+def check_vm(ctx: Ctx, addr: str, vm: str | None) -> Check:
     vms = probe.vms_referencing(ctx.xml_dir, addr)
+    fix = ""
     if vm is not None:
         ok = vm in vms
         detail = (
@@ -168,6 +177,8 @@ def build_checks(ctx: Ctx, addr: str, vm: str | None) -> list[tuple[str, bool, s
     else:
         ok = bool(vms)
         detail = ", ".join(vms) if vms else "no VM XML references this device"
+    if not ok:
+        fix = "add the GPU to the VM as a PCI <hostdev> (virsh edit VM)"
     if not vms:
         locked = probe.unreadable_xml(ctx.xml_dir)
         if locked:
@@ -175,53 +186,86 @@ def build_checks(ctx: Ctx, addr: str, vm: str | None) -> list[tuple[str, bool, s
             ok = None
             detail = (f"cannot read {locked} VM XML file(s) in {ctx.xml_dir}; "
                       "run as root or point GPU_HANDOFF_XML_DIR at readable copies")
-    rows.append(("vm references device", ok, detail))
+            fix = ""
+    return Check("vm references device", ok, detail, fix)
 
+
+def check_holders(ctx: Ctx, addr: str, vm: str | None) -> Check:
     holders = probe.device_holders(ctx.proc)
     if holders:
         detail = "; ".join(f"pid {p} ({c}) {n}" for p, c, n in holders)
     else:
         detail = "no process holds /dev/nvidia*"
-    rows.append(("no host process holds gpu", not holders, detail))
+    return Check("no host process holds gpu", not holders, detail)
 
-    methods = probe.reset_methods(sysfs, addr)
+
+def check_reset(ctx: Ctx, addr: str, vm: str | None) -> Check:
+    methods = probe.reset_methods(ctx.sysfs, addr)
     if methods is None:
-        rows.append(("reset method", False, "reset_method file missing"))
-    elif not methods:
-        rows.append(("reset method", False, "device lists no reset method"))
-    else:
-        rows.append(("reset method", True, methods))
+        return Check("reset method", False, "reset_method file missing")
+    if not methods:
+        return Check("reset method", False, "device lists no reset method")
+    return Check("reset method", True, methods)
 
+
+def check_siblings(ctx: Ctx, addr: str, vm: str | None) -> Check:
+    sysfs = ctx.sysfs
+    drv = probe.current_driver(sysfs, addr)
     siblings = probe.audio_siblings(sysfs, addr)
     if not siblings:
-        rows.append(("audio siblings", True, "none"))
-    else:
-        mismatched = [
-            s
-            for s in siblings
-            if (probe.current_driver(sysfs, s) == VFIO) != (drv == VFIO)
+        return Check("audio siblings", True, "none")
+    mismatched = [
+        s for s in siblings if (probe.current_driver(sysfs, s) == VFIO) != (drv == VFIO)
+    ]
+    detail = ", ".join(f"{s} ({probe.current_driver(sysfs, s)})" for s in siblings)
+    if mismatched:
+        detail += " - driver differs from the GPU function"
+    return Check("audio siblings", not mismatched, detail)
+
+
+PRECHECKS = (
+    check_group,
+    check_driver,
+    check_vm,
+    check_holders,
+    check_reset,
+    check_siblings,
+)
+
+
+def build_checks(ctx: Ctx, addr: str, vm: str | None) -> list[Check]:
+    if not probe.device_exists(ctx.sysfs, addr):
+        return [
+            Check(
+                "device present",
+                False,
+                f"{addr} not found under {ctx.sysfs}",
+                "find the GPU's full address with: lspci -Dnn | grep -Ei 'vga|3d|display'",
+            )
         ]
-        detail = ", ".join(f"{s} ({probe.current_driver(sysfs, s)})" for s in siblings)
-        if mismatched:
-            detail += " - driver differs from the GPU function"
-        rows.append(("audio siblings", not mismatched, detail))
-    return rows
+    return [Check("device present", True, addr)] + [
+        check(ctx, addr, vm) for check in PRECHECKS
+    ]
 
 
-def render_table(rows: list[tuple[str, bool | None, str]]) -> str:
-    """ok is True (PASS), False (FAIL) or None (WARN: could not check)."""
-    width = max(len(r[0]) for r in rows)
+def render_table(rows: list[Check]) -> str:
+    """The PASS/WARN/FAIL table, then one fix line per row that did not pass."""
+    width = max(len(r.name) for r in rows)
     lines = [f"{'CHECK':<{width}}  RESULT  DETAIL"]
-    for name, ok, detail in rows:
-        word = "WARN" if ok is None else ("PASS" if ok else "FAIL")
-        lines.append(f"{name:<{width}}  {word:<6}  {detail}")
+    for r in rows:
+        word = "WARN" if r.ok is None else ("PASS" if r.ok else "FAIL")
+        lines.append(f"{r.name:<{width}}  {word:<6}  {r.detail}")
+    fixes = [r for r in rows if r.ok is not True and r.fix]
+    if fixes:
+        lines.append("")
+        lines.extend(f"fix: {r.name}: {r.fix}" for r in fixes)
     return "\n".join(lines)
 
 
 def cmd_precheck(ctx: Ctx, args) -> int:
     rows = build_checks(ctx, args.addr, args.vm)
     print(render_table(rows))
-    return EXIT_OK if all(ok is not False for _, ok, _ in rows) else EXIT_FAIL
+    return EXIT_OK if all(r.ok is not False for r in rows) else EXIT_FAIL
 
 
 # --------------------------------------------------------------------------
