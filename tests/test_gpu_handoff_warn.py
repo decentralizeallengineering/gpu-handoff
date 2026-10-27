@@ -4,7 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from gpu_handoff import probe
-from gpu_handoff.cli import render_table
+from gpu_handoff.cli import Check, render_table
 
 
 class UnreadableXmlTest(unittest.TestCase):
@@ -15,7 +15,7 @@ class UnreadableXmlTest(unittest.TestCase):
             f.write_text("<domain/>")
             f.chmod(0)
             self.assertEqual(probe.unreadable_xml(Path(d)), 1)
-            self.assertIn("WARN", render_table([("vm references device", None, "x")]))
+            self.assertIn("WARN", render_table([Check("vm references device", None, "x")]))
 
 
 if __name__ == "__main__":

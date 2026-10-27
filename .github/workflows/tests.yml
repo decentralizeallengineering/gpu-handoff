@@ -5,11 +5,12 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python: ["3.10", "3.12"]
+        python: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: pip install pytest
-      - run: python -m pytest -q || [ $? -eq 5 ]
+      - run: pip install . pytest
+      - run: gpu-handoff --help
+      - run: python -m pytest -q
